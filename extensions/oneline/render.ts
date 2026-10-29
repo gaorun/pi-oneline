@@ -1,9 +1,12 @@
 /**
  * 工具渲染器：把工具调用画成折叠行（group）或每条一行（row）。
+ *
+ * 关键约束：每个工具行只读它**自己那一轮**的批次。批次在回合结束后冻结，
+ * 所以旧回合的汇总不会跟着当前回合变化。
  */
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import type { Batch, Palette } from "./batch.ts";
+import type { Batch, CallRec, Palette } from "./batch.ts";
 import { detailLines, summaryLine } from "./batch.ts";
 import type { Config } from "./config.ts";
 import { trace } from "./trace.ts";
@@ -23,12 +26,20 @@ export class Line implements Component {
         invalidate(): void {}
 }
 
-export interface RenderDeps {
+/** 一行工具调用所属的批次。`live` 表示它属于正在进行的回合。 */
+export interface RowContext {
         batch: Batch;
+        rec: CallRec;
+        live: boolean;
+}
+
+export interface RenderDeps {
         cfg: () => Config;
         mode: () => "off" | "row" | "group";
         expanded: () => boolean;
         frame: () => number;
+        /** 解析某次调用属于哪个批次；历史转录（如 /resume 重建）无法归属时返回 undefined。 */
+        resolveRow: (toolCallId: string, toolName: string) => RowContext | undefined;
         hit: () => void;
         onError: (error: unknown) => void;
 }
@@ -112,39 +123,56 @@ export interface BuiltRenderers {
 export function makeRenderers(toolName: string, deps: RenderDeps): BuiltRenderers {
         const pad = (ctx: any) => " ".repeat(Math.max(0, ctx?.outputPad ?? 1));
 
+        /** 单行形态：只有工具名 + 参数，用于 row 模式与历史转录。 */
+        const singleLine = (theme: any, indent: string, rec: { target: string }) =>
+                new Line((width) => {
+                        const p = paletteOf(theme);
+                        const text = `${p.bold(toolName)}${rec.target ? ` ${p.accent(rec.target)}` : ""}`;
+                        return [truncateToWidth(indent + text, width)];
+                });
+
         return {
                 renderShell: "self",
 
                 renderCall(args: any, theme: any, ctx: any) {
                         deps.hit();
                         try {
-                                const batch = deps.batch;
-                                const rec = batch.ensure(ctx.toolCallId, toolName);
-                                rec.target = describeArgs(toolName, args);
-                                batch.setInvalidator(ctx.toolCallId, ctx.invalidate);
+                                const rc = deps.resolveRow(ctx.toolCallId, toolName);
+                                if (!rc) {
+                                        // 历史转录：无法归属到某一轮，退化成每条调用一行，不误导
+                                        const target = describeArgs(toolName, args);
+                                        trace({ ev: "render-call", id: ctx.toolCallId, mode: "history", isLast: true, lines: 1 });
+                                        return singleLine(theme, pad(ctx), { target });
+                                }
+                                rc.rec.target = describeArgs(toolName, args);
+                                rc.batch.setInvalidator(ctx.toolCallId, ctx.invalidate);
 
                                 const indent = pad(ctx);
-
                                 if (deps.mode() === "row") {
-                                        trace({ ev: "render-call", id: ctx.toolCallId, isLast: batch.isLast(ctx.toolCallId), lines: 1, mode: "row" });
-                                        return new Line((width) => {
-                                                const p = paletteOf(theme);
-                                                const text = `${p.bold(toolName)}${rec.target ? ` ${p.accent(rec.target)}` : ""}`;
-                                                return [truncateToWidth(indent + text, width)];
-                                        });
+                                        trace({ ev: "render-call", id: ctx.toolCallId, batch: rc.batch.id, mode: "row", isLast: rc.batch.isLast(ctx.toolCallId), lines: 1 });
+                                        return singleLine(theme, indent, rc.rec);
                                 }
 
-                                const isLast = batch.isLast(ctx.toolCallId);
+                                const isLast = rc.batch.isLast(ctx.toolCallId);
                                 if (!isLast) {
-                                        trace({ ev: "render-call", id: ctx.toolCallId, isLast, lines: 0, mode: "group" });
+                                        trace({ ev: "render-call", id: ctx.toolCallId, batch: rc.batch.id, mode: "group", isLast, lines: 0 });
                                         return new Line(() => []);
                                 }
 
                                 return new Line((width) => {
                                         const p = paletteOf(theme);
                                         const cfg = deps.cfg();
-                                        const line = summaryLine(batch, { cfg, now: Date.now(), frame: deps.frame(), width: width - indent.length, p });
-                                        trace({ ev: "render-call", id: ctx.toolCallId, isLast, lines: line ? 1 : 0, mode: "group", text: strip(line) });
+                                        const line = summaryLine(rc.batch, { cfg, now: Date.now(), frame: deps.frame(), width: width - indent.length, p });
+                                        trace({
+                                                ev: "render-call",
+                                                id: ctx.toolCallId,
+                                                batch: rc.batch.id,
+                                                mode: "group",
+                                                isLast,
+                                                lines: line ? 1 : 0,
+                                                calls: rc.batch.calls.length,
+                                                text: strip(line),
+                                        });
                                         return line ? [truncateToWidth(indent + line, width)] : [];
                                 });
                         } catch (error) {
@@ -156,12 +184,15 @@ export function makeRenderers(toolName: string, deps: RenderDeps): BuiltRenderer
                 renderResult(result: any, opts: any, theme: any, ctx: any) {
                         deps.hit();
                         try {
-                                const batch = deps.batch;
-                                const rec = batch.ensure(ctx.toolCallId, toolName);
-                                rec.result = describeResult(toolName, result);
-                                if (opts?.isError || result?.isError) rec.isError = true;
-                                if (typeof ctx?.durationMs === "number") rec.durationMs = ctx.durationMs;
-                                batch.setInvalidator(ctx.toolCallId, ctx.invalidate);
+                                const rc = deps.resolveRow(ctx.toolCallId, toolName);
+                                if (!rc) {
+                                        trace({ ev: "render-result", id: ctx.toolCallId, mode: "history", lines: 0 });
+                                        return new Line(() => []);
+                                }
+                                rc.rec.result = describeResult(toolName, result);
+                                if (opts?.isError || result?.isError) rc.rec.isError = true;
+                                if (typeof ctx?.durationMs === "number") rc.rec.durationMs = ctx.durationMs;
+                                rc.batch.setInvalidator(ctx.toolCallId, ctx.invalidate);
 
                                 const expanded = !!(opts?.expanded || deps.expanded());
                                 const indent = pad(ctx);
@@ -169,24 +200,24 @@ export function makeRenderers(toolName: string, deps: RenderDeps): BuiltRenderer
 
                                 if (deps.mode() === "row") {
                                         if (!expanded) {
-                                                trace({ ev: "render-result", id: ctx.toolCallId, lines: 0, mode: "row" });
+                                                trace({ ev: "render-result", id: ctx.toolCallId, batch: rc.batch.id, mode: "row", lines: 0 });
                                                 return new Line(() => []);
                                         }
                                         const text = (result?.content ?? []).find((c: any) => c?.type === "text")?.text ?? "";
                                         const preview = text.trim().split("\n").slice(0, cfg.maxDetailLines);
-                                        trace({ ev: "render-result", id: ctx.toolCallId, lines: preview.length, mode: "row" });
+                                        trace({ ev: "render-result", id: ctx.toolCallId, batch: rc.batch.id, mode: "row", lines: preview.length });
                                         return new Line((width) => preview.map((l: string) => truncateToWidth(`${indent}${paletteOf(theme).muted(l)}`, width)));
                                 }
 
-                                if (!batch.isLast(ctx.toolCallId) || !expanded) {
-                                        trace({ ev: "render-result", id: ctx.toolCallId, lines: 0, mode: "group" });
+                                if (!rc.batch.isLast(ctx.toolCallId) || !expanded) {
+                                        trace({ ev: "render-result", id: ctx.toolCallId, batch: rc.batch.id, mode: "group", lines: 0 });
                                         return new Line(() => []);
                                 }
 
                                 return new Line((width) => {
                                         const p = paletteOf(theme);
-                                        const lines = detailLines(batch, { cfg, p });
-                                        trace({ ev: "render-result", id: ctx.toolCallId, lines: lines.length, mode: "group" });
+                                        const lines = detailLines(rc.batch, { cfg, p });
+                                        trace({ ev: "render-result", id: ctx.toolCallId, batch: rc.batch.id, mode: "group", lines: lines.length });
                                         return lines.map((l) => truncateToWidth(indent + l, width));
                                 });
                         } catch (error) {

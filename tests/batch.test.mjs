@@ -116,4 +116,43 @@ const opts = (b, extra = {}) => ({ cfg: { ...cfg, ...extra.cfg }, now: extra.now
         assert.equal(elapsedOf(b, 9000), "3.0s");
 }
 
-console.log("batch.test.mjs: 9 组断言全部通过");
+// 10. 多轮隔离：上一轮冻结后，当前轮的变化不得影响它
+{
+        const prev = makeBatch([
+                { id: "p1", name: "ls", start: 0, end: 100 },
+                { id: "p2", name: "read", start: 100, end: 200 },
+        ]);
+        prev.turnEndedAt = 200;
+        prev.freeze(false);
+        const before = plain((p) => summaryLine(prev, { ...opts(prev, { now: 10_000 }), p }));
+
+        // 第二轮进行中
+        const cur = makeBatch([
+                { id: "c1", name: "bash", start: 1000, end: 1200 },
+                { id: "c2", name: "edit", start: 1200, end: 1400 },
+                { id: "c3", name: "grep", start: 1400, end: 1600 },
+        ]);
+        const after = plain((p) => summaryLine(prev, { ...opts(prev, { now: 10_000 }), p }));
+
+        assert.equal(before, "▸ 2 calls · ls read · 0.2s");
+        assert.equal(after, before, "上一轮的汇总被当前轮改动了");
+        // 未 fetch turn_end：耗时量到"最后一次工具结束"= 1600-1000 = 0.6s
+        assert.equal(plain((p) => summaryLine(cur, { ...opts(cur, { now: 2000 }), p })), "▸ 3 calls · bash edit grep · 0.6s");
+}
+
+// 11. 每个批次有独立 id
+{
+        const a = new Batch();
+        const b = new Batch();
+        assert.notEqual(a.id, b.id);
+}
+
+// 12. 冻结后的耗时不再滚动
+{
+        const b = makeBatch([{ id: "x", name: "ls", start: 1000, end: 1500 }]);
+        b.turnEndedAt = 2000;
+        b.freeze(false);
+        assert.equal(elapsedOf(b, 99_000), "1.0s");
+}
+
+console.log("batch.test.mjs: 12 组断言全部通过");

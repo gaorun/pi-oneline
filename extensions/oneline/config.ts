@@ -12,9 +12,6 @@ export interface Config {
         markerStyle: MarkerStyle;
         maxDetailLines: number;
         shortcut: string;
-        hideThinking: boolean;
-        /** `/oneline setup` 改写 `hideThinkingBlock` 之前的值，`/oneline reset` 用它还原。 */
-        hideThinkingBackup?: boolean | null;
 }
 
 export const DEFAULTS: Config = {
@@ -23,13 +20,10 @@ export const DEFAULTS: Config = {
         markerStyle: "braille",
         maxDetailLines: 12,
         shortcut: "alt+t",
-        hideThinking: true,
-        hideThinkingBackup: null,
 };
 
 export const AGENT_DIR = process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 export const CONFIG_PATH = join(AGENT_DIR, "pi-oneline.json");
-export const SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
 const MODES: Mode[] = ["off", "row", "group"];
 
@@ -51,10 +45,6 @@ export function loadConfig(): Config {
         if (raw.markerStyle === "braille" || raw.markerStyle === "dot") cfg.markerStyle = raw.markerStyle;
         if (typeof raw.maxDetailLines === "number" && raw.maxDetailLines > 0) cfg.maxDetailLines = Math.floor(raw.maxDetailLines);
         if (typeof raw.shortcut === "string") cfg.shortcut = raw.shortcut;
-        if (typeof raw.hideThinking === "boolean") cfg.hideThinking = raw.hideThinking;
-        if (typeof raw.hideThinkingBackup === "boolean" || raw.hideThinkingBackup === null) {
-                cfg.hideThinkingBackup = raw.hideThinkingBackup;
-        }
         // 临时覆盖（集成测试、演示），不写回文件
         const envMode = process.env.PI_ONELINE_MODE as Mode | undefined;
         if (envMode && MODES.includes(envMode)) cfg.mode = envMode;

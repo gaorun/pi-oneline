@@ -4,24 +4,30 @@
  * - `group`：整批占 1 行（除末行外其余行渲染 0 高度），展开时明细画在同一行下方
  * - `row`：每次调用 1 行（纯公开 API，作为 group 的降级形态）
  * - `off`：完全交给 pi 原生渲染
+ *
+ * 每轮对话是一个独立批次：回合结束即冻结，旧回合的汇总不会跟着新回合变化。
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Batch } from "./batch.ts";
 import { CONFIG_PATH, loadConfig, saveConfig, type Config } from "./config.ts";
-import { makeRenderers } from "./render.ts";
-import { getHideThinkingBlock, setHideThinkingBlock, unsetHideThinkingBlock } from "./settings.ts";
+import { makeRenderers, type RowContext } from "./render.ts";
 import { trace } from "./trace.ts";
 
 export default function (pi: ExtensionAPI) {
         let cfg: Config = loadConfig();
-        const batch = new Batch();
+
+        /** 当前进行中的批次；回合结束后置空，但批次本身仍被它自己的行引用。 */
+        let live: Batch | undefined;
+        /** 所有还活着的批次（历史行重建时需要读它们）。 */
+        const batches = new Map<number, Batch>();
+        /** toolCallId → 它所属的批次。 */
+        const owner = new Map<string, Batch>();
 
         let frame = 0;
         let timer: ReturnType<typeof setInterval> | undefined;
         let degraded = false;
         let hitCount = 0;
         let warnedDegrade = false;
-        let warnedThinking = false;
         let forcedExpand = false;
         let ui: any;
 
@@ -43,10 +49,10 @@ export default function (pi: ExtensionAPI) {
         }
 
         function ensureTimer(): void {
-                if (timer || mode() === "off" || !batch.anyRunning()) return;
+                if (timer || mode() === "off" || !live?.anyRunning()) return;
                 timer = setInterval(() => {
                         frame += 1;
-                        batch.invalidateLast();
+                        live?.invalidateLast();
                 }, 90);
         }
 
@@ -61,22 +67,44 @@ export default function (pi: ExtensionAPI) {
                 if (degraded) return;
                 degraded = true;
                 stopTimer();
-                batch.invalidateAll();
+                for (const batch of batches.values()) batch.invalidateAll();
                 if (!warnedDegrade) {
                         warnedDegrade = true;
                         notify(`pi-oneline: 渲染异常，已退回 row 模式（${String(error)}）`, "warning");
                 }
         }
 
+        function openBatch(): Batch {
+                const batch = new Batch();
+                batches.set(batch.id, batch);
+                live = batch;
+                return batch;
+        }
+
+        /**
+         * 把一次调用归属到它的批次。
+         * - 已归属：返回原批次（可能已冻结）
+         * - 未知且存在进行中的回合：归入当前批次
+         * - 未知且没有进行中的回合：历史转录（如 /resume 重建），返回 undefined
+         */
+        function resolveRow(toolCallId: string, toolName: string): RowContext | undefined {
+                const known = owner.get(toolCallId);
+                if (known) return { batch: known, rec: known.ensure(toolCallId, toolName), live: known === live };
+                if (!live) return undefined;
+                const rec = live.ensure(toolCallId, toolName);
+                owner.set(toolCallId, live);
+                return { batch: live, rec, live: true };
+        }
+
         pi.registerToolRenderer((toolName, next) => {
                 const base = next();
                 if (mode() === "off") return base;
                 const ours = makeRenderers(toolName, {
-                        batch,
                         cfg: () => cfg,
                         mode,
                         expanded: () => forcedExpand,
                         frame: () => frame,
+                        resolveRow,
                         hit: () => {
                                 hitCount += 1;
                         },
@@ -88,17 +116,14 @@ export default function (pi: ExtensionAPI) {
         pi.on("session_start", async (_event, ctx) => {
                 ui = ctx.ui;
                 cfg = loadConfig();
-                batch.reset();
+                batches.clear();
+                owner.clear();
+                live = undefined;
                 degraded = false;
                 hitCount = 0;
                 forcedExpand = false;
                 stopTimer();
                 refreshStatus();
-
-                if (cfg.hideThinking && getHideThinkingBlock() !== true && !warnedThinking) {
-                        warnedThinking = true;
-                        notify("pi-oneline: 思考块尚未折叠，运行 /oneline setup 生效（需要重载）", "info");
-                }
         });
 
         pi.on("session_shutdown", async () => {
@@ -106,7 +131,7 @@ export default function (pi: ExtensionAPI) {
         });
 
         pi.on("agent_start", async () => {
-                batch.reset();
+                openBatch();
                 hitCount = 0;
                 frame = 0;
                 stopTimer();
@@ -114,9 +139,12 @@ export default function (pi: ExtensionAPI) {
 
         // 一批调用的顺序必须在组件渲染之前就知道，否则会出现"先出现后消失"的一帧
         const preregister = (message: any) => {
-                if (message?.role !== "assistant") return;
+                if (message?.role !== "assistant" || !live) return;
                 for (const content of message.content ?? []) {
-                        if (content?.type === "toolCall") batch.ensure(content.id, content.name);
+                        if (content?.type === "toolCall") {
+                                live.ensure(content.id, content.name);
+                                owner.set(content.id, live);
+                        }
                 }
         };
 
@@ -124,38 +152,46 @@ export default function (pi: ExtensionAPI) {
         pi.on("message_update", async (event: any) => preregister(event.message));
 
         pi.on("tool_execution_start", async (event: any) => {
-                if (event.parentToolCallId) return;
-                const rec = batch.ensure(event.toolCallId, event.toolName);
+                if (event.parentToolCallId || !live) return;
+                const rec = live.ensure(event.toolCallId, event.toolName);
+                owner.set(event.toolCallId, live);
                 rec.startedAt = Date.now();
-                trace({ ev: "start", id: event.toolCallId, name: event.toolName });
+                trace({ ev: "start", id: event.toolCallId, name: event.toolName, batch: live.id });
                 ensureTimer();
         });
 
         pi.on("tool_execution_end", async (event: any) => {
                 if (event.parentToolCallId) return;
+                const batch = owner.get(event.toolCallId);
+                if (!batch) return;
                 const rec = batch.ensure(event.toolCallId, event.toolName);
                 rec.endedAt = Date.now();
                 if (event.isError) rec.isError = true;
                 if (typeof event.durationMs === "number") rec.durationMs = event.durationMs;
-                trace({ ev: "end", id: event.toolCallId, isError: !!event.isError });
+                trace({ ev: "end", id: event.toolCallId, isError: !!event.isError, batch: batch.id });
                 if (!batch.anyRunning()) stopTimer();
                 batch.invalidateAll();
         });
 
         pi.on("turn_end", async () => {
                 // 耗时量到回合结束（含模型侧收尾），与设计 §3.2 一致
-                if (batch.anyRunning()) return;
-                batch.turnEndedAt = Date.now();
+                if (!live || live.anyRunning()) return;
+                live.turnEndedAt = Date.now();
                 stopTimer();
-                batch.invalidateAll();
+                live.invalidateAll();
         });
 
         pi.on("agent_end", async () => {
-                if (batch.calls.some((c) => c.startedAt !== undefined && c.endedAt === undefined)) batch.interrupted = true;
+                const finished = live;
+                if (!finished) return;
+                const unfinished = finished.calls.some((c) => c.startedAt !== undefined && c.endedAt === undefined);
+                finished.freeze(unfinished);
+                trace({ ev: "agent_end", batch: finished.id, ids: finished.calls.map((c) => c.id), calls: finished.calls.length, interrupted: unfinished });
                 stopTimer();
-                batch.invalidateAll();
-                trace({ ev: "agent_end", ids: batch.calls.map((c) => c.id), calls: batch.calls.length, interrupted: batch.interrupted });
-                if (batch.calls.length > 0 && hitCount === 0) degrade("工具渲染器未被调用");
+                finished.invalidateAll();
+                // 冻结之后，这一轮的行仍然只读自己的批次；新的回合会开新批次
+                live = undefined;
+                if (finished.calls.length > 0 && hitCount === 0) degrade("工具渲染器未被调用");
         });
 
         pi.on("agent_settled", async (_event, ctx) => {
@@ -168,7 +204,7 @@ export default function (pi: ExtensionAPI) {
                                 description: "切换 pi-oneline 的明细视图",
                                 handler: async () => {
                                         forcedExpand = !forcedExpand;
-                                        batch.invalidateAll();
+                                        for (const batch of batches.values()) batch.invalidateAll();
                                 },
                         });
                 } catch {
@@ -177,20 +213,18 @@ export default function (pi: ExtensionAPI) {
         }
 
         pi.registerCommand("oneline", {
-                description: "pi-oneline：off | row | group | setup | reset | toggle | info",
+                description: "pi-oneline：off | row | group | toggle | info",
                 handler: async (args, ctx) => {
                         ui = ctx.ui;
                         const sub = args.trim().toLowerCase();
 
                         if (!sub || sub === "info") {
-                                const current = getHideThinkingBlock();
                                 ctx.ui.notify(
                                         [
                                                 `模式：${mode()}${degraded ? "（已降级）" : ""}`,
                                                 `标签：${cfg.labels} · 标记：${cfg.markerStyle}`,
-                                                `hideThinkingBlock：${current === undefined ? "未设置" : current}，备份：${cfg.hideThinkingBackup ?? "无"}`,
                                                 `配置：${CONFIG_PATH}`,
-                                                `本回合调用：${batch.calls.length}`,
+                                                `本回合调用：${live?.calls.length ?? 0} · 会话内批次：${batches.size}`,
                                         ].join("\n"),
                                         "info",
                                 );
@@ -200,7 +234,7 @@ export default function (pi: ExtensionAPI) {
                         if (sub === "off" || sub === "row" || sub === "group") {
                                 cfg.mode = sub;
                                 saveConfig(cfg);
-                                batch.invalidateAll();
+                                for (const batch of batches.values()) batch.invalidateAll();
                                 refreshStatus();
                                 ctx.ui.notify(`pi-oneline 模式：${cfg.mode}（对新组件生效）`, "info");
                                 return;
@@ -208,32 +242,11 @@ export default function (pi: ExtensionAPI) {
 
                         if (sub === "toggle") {
                                 forcedExpand = !forcedExpand;
-                                batch.invalidateAll();
+                                for (const batch of batches.values()) batch.invalidateAll();
                                 return;
                         }
 
-                        if (sub === "setup") {
-                                const before = getHideThinkingBlock();
-                                cfg.hideThinkingBackup = before ?? null;
-                                saveConfig(cfg);
-                                const changed = setHideThinkingBlock(true);
-                                ctx.ui.notify(changed ? "已写入 hideThinkingBlock=true，重载后生效" : "hideThinkingBlock 已是 true", "info");
-                                await ctx.reload();
-                                return;
-                        }
-
-                        if (sub === "reset") {
-                                const backup = cfg.hideThinkingBackup;
-                                cfg.hideThinkingBackup = null;
-                                saveConfig(cfg);
-                                const changed = backup === null || backup === undefined ? unsetHideThinkingBlock() : setHideThinkingBlock(backup);
-                                const what = backup === null || backup === undefined ? "移除 hideThinkingBlock" : `还原 hideThinkingBlock=${backup}`;
-                                ctx.ui.notify(changed ? `已${what}，重载后生效` : "无需还原", "info");
-                                await ctx.reload();
-                                return;
-                        }
-
-                        ctx.ui.notify("用法：/oneline [off|row|group|setup|reset|toggle|info]", "warning");
+                        ctx.ui.notify("用法：/oneline [off|row|group|toggle|info]", "warning");
                 },
         });
 }

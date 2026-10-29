@@ -96,11 +96,9 @@ pi -e ./extensions/oneline     # 单次试跑，不改配置
 
 | 操作 | 说明 |
 |---|---|
-| `/oneline` 或 `/oneline info` | 当前模式、标签、`hideThinkingBlock` 状态、配置路径、本回合调用数 |
+| `/oneline` 或 `/oneline info` | 当前模式、标签、配置路径、本回合调用数、会话内批次 |
 | `/oneline off\|row\|group` | 切换模式并写入配置 |
 | `/oneline toggle` · `alt+t` · 点击该行 · `ctrl+o` | 展开/收起明细 |
-| `/oneline setup` | 写入 `hideThinkingBlock=true` 并重载，让思考块折成 1 行 |
-| `/oneline reset` | 把 `hideThinkingBlock` 还原成 `setup` 之前的值 |
 
 `~/.pi/agent/pi-oneline.json`（可缺省；非法值退回默认，不报错）：
 
@@ -110,8 +108,7 @@ pi -e ./extensions/oneline     # 单次试跑，不改配置
   "labels": "en",
   "markerStyle": "braille",
   "maxDetailLines": 12,
-  "shortcut": "alt+t",
-  "hideThinking": true
+  "shortcut": "alt+t"
 }
 ```
 
@@ -122,7 +119,6 @@ pi -e ./extensions/oneline     # 单次试跑，不改配置
 | `markerStyle` | `braille`（`⠋⠙⠹…`）或 `dot`（`●○`） |
 | `maxDetailLines` | 展开时最多列几条，默认 12 |
 | `shortcut` | 设成 `""` 可关闭快捷键 |
-| `hideThinking` | `true` 时提示折叠思考块，配合 `/oneline setup` |
 
 两个环境变量：`PI_AGENT_DIR` 改写配置目录，`PI_ONELINE_DEBUG` 指定路径后把渲染决策写成 JSONL（集成测试据此断言）。
 
@@ -133,29 +129,41 @@ npm test                    # 纯逻辑单测，不需要 pi 运行时
 npm run test:integration    # 在 PTY 里跑真实 pi 会话
 ```
 
-单测覆盖汇总行的结束态、单复数、失败尾注、宽度降级、中文标签、明细行数截断等 9 组断言。
+单测覆盖汇总行的结束态、单复数、失败尾注、宽度降级、中文标签、明细行数截断、多轮隔离等 12 组断言。
 
-集成测试脚本覆盖 `group`、展开、`row`、`off` 四个场景，断言：末态只有一行有内容、同帧不会出现双行、降级后不回弹。`alt+t` 快捷键与 `/oneline info` 的验证见 DESIGN 附录 A.2。
+集成测试脚本覆盖 `group`、展开、`row`、`off` 四个场景，断言：末态只有一行有内容、同帧不会出现双行、降级后不回弹。多轮场景用 `--prompt2` 追加第二轮，断言两个批次各留自己的汇总、互不污染。`alt+t` 快捷键与 `/oneline info` 的验证见 DESIGN 附录 A.2。
 
-## 七、已知边界
+## 七、多轮会话
 
+每轮对话是一个独立批次。回合结束即冻结：该轮的汇总行锁住自己的调用数、工具分布与耗时，后面再跑几轮也不会变；新一轮只会新增自己的一行。
+
+```text
+▸ 2 calls · ls read · 1.2s        ← 第一轮，已冻结
+（模型回复）
+▸ 3 calls · bash edit grep · 4.0s ← 第二轮，独立统计
+```
+
+历史转录（`/resume` 重建、或切到旧分支）无法归属到某一轮，这些工具行降级为「每次调用一行」，不会编造一个合在一起的汇总。
+
+## 八、已知边界
 | 边界 | 说明 |
 |---|---|
-| 有思考的回合占 2 行 | 思考标签由 pi 原生渲染，扩展无法并入汇总行（实测：标签设为空串仍渲染 1 行）。无思考的回合才是真正的 1 行 |
+| 只折叠工具调用 | 思考块、模型正文、用户消息均保持 pi 原生显示，不做隐藏 |
+| 每轮独立快照 | 一轮结束即冻结：旧回合的汇总行不会跟着当前回合变化（见下） |
 | 依赖 pi 的内部渲染时序 | `group` 靠「空 self-shell 渲染 0 行」+ 定向 `invalidate()` 成立，属版本跟随成本。不能启动自检——包的 `exports` 白名单挡住了 `dist/` 深引用；改为运行时保护：渲染器报错或整回合未被调用，就退回 `row` 并提示一次 |
 | 只在 pi 1.4.0 上验证过 | 机制与字段均据 1.4.0 源码定；`peerDependencies` 未固定版本下限，pi 升级后应重跑 `npm run test:integration` |
 | 会在 `message_start` 预注册本批调用 | pi 在参数流式阶段一次建好全部工具组件，晚注册会出现 1 帧双行 |
 | 接管其他扩展的工具渲染 | `group`/`row` 下会覆盖它们给工具加的自定义渲染；`off` 完全放行 |
 | HTML 导出可能缺详情 | 隐藏行仍在转录模型里。导出前切 `row`：`PI_ONELINE_MODE=row pi export ...` |
 
-## 八、不做
+## 九、不做
 
 - 不改动发给模型的上下文（纯显示层）
 - 不改变工具执行与结果内容
 - 不做日志、链路类功能
-- 不追求删掉思考块——做不到，只能压到 1 行
+- 不动思考块：不隐藏、不折叠、不改 `hideThinkingBlock`，保持 pi 原生显示
 
-## 九、文档
+## 十、文档
 
 | 文档 | 内容 |
 |---|---|

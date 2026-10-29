@@ -1,14 +1,16 @@
 # pi-oneline 设计规格
 
-目标：让 pi 的会话转录读起来像 Delta —— 模型思考与工具调用不再各占一块，而是收成一行摘要，可展开看详情，工作中有一个动态标记。
+目标：让 pi 的会话转录读起来像 Delta —— 一批工具调用收成一行摘要，可展开看详情，工作中有一个动态标记。思考块、模型正文保持 pi 原生显示。
 
 ## 1. 范围
 
 | 折叠 | 不折叠 |
 |---|---|
 | 一次模型回合内的全部工具调用 | 用户消息 |
-| 模型思考块（压到 1 行，见 §5） | 助手输出正文 |
-| 工具调用的参数与结果预览 | 错误/中断提示、压缩摘要、扩展自定义消息 |
+| 工具调用的参数与结果预览 | 助手输出正文、**模型思考块** |
+| — | 错误/中断提示、压缩摘要、扩展自定义消息 |
+
+思考块不做任何处理：不隐藏、不折叠、不改 `hideThinkingBlock`。
 
 ## 2. 三种显示层级
 
@@ -117,12 +119,24 @@
 - 超过 12 条时只列前 12 条，末尾追加 `  └ … +18 more`
 - 单次耗时来自渲染上下文的 `durationMs`；缺失时省略该列
 
-## 5. 与思考块的关系（边界）
+## 5. 多轮隔离（每轮一个批次）
 
-- pi 仅在模型产生 thinking 内容时才渲染思考块；开启 `hideThinkingBlock` 后固定为 1 行斜体标签。
-- 该行由 pi 原生渲染，扩展**无法并入汇总行，也无法删除**。实测：`theme.italic(theme.fg("thinkingText", ""))` 求值为 `\x1b[39m\x1b[2m\x1b[22;39m`（17 字节），`new Text(...).render(80)` 返回 **1 行**；只有真正的 `Text("")` 返回 0 行，而 `theme.italic()` 必然给空串加上转义码。
-- 结论：每个有思考的回合占 **2 行**（思考标签 + 汇总行），无思考的回合占 **1 行**。
-- 标签默认 `⋯ thinking` / 中文 `⋯ 思考`，不含耗时（标签是会话级全局值，无法逐回合改写）。
+每一轮对话是一个独立批次，回合结束即**冻结**。
+
+| 时刻 | 行为 |
+|---|---|
+| `agent_start` | 新建批次，成为"当前批次" |
+| `tool_execution_*` | 只写入当前批次 |
+| `turn_end` | 记录耗时终点，刷新该批次所有行 |
+| `agent_end` | 冻结批次（有未完成的调用则标记为中断），当前批次置空 |
+
+渲染时每个工具行只读**自己所属的批次**，因此：
+
+- 旧回合的汇总行锁住自己的调用数、工具分布、耗时，后续回合不会改写它；
+- 新回合只新增自己的一行；
+- 批次冻结后耗时不再滚动。
+
+**历史转录**（`/resume` 重建、切到旧分支）在渲染时没有事件可依，无法把行归属到某一轮。这类行降级为"每次调用一行"，不编造合并汇总。
 
 ## 6. 交互
 
@@ -132,6 +146,7 @@
 | `ctrl+o` | pi 原生"展开全部工具输出"，汇总行跟随（语义一致，不额外拦截） |
 | `alt+t`（可配） | 只切换 pi-oneline 的明细视图 |
 | `/oneline` | `off \| row \| group` 切换模式 |
+| `/oneline toggle` | 切换明细视图（等同 `alt+t`） |
 | `/oneline info` | 显示当前模式、本回合统计、生效配置路径 |
 
 ## 7. 配置
@@ -144,18 +159,11 @@
   "labels": "en",
   "markerStyle": "braille",
   "maxDetailLines": 12,
-  "shortcut": "alt+t",
-  "hideThinking": true
+  "shortcut": "alt+t"
 }
 ```
 
-`hideThinking: true` 需要 `~/.pi/agent/settings.json` 里的 `hideThinkingBlock: true`。
-
-**生效时机很重要**：该值由 `SettingsManager` 在启动时读入内存，扩展没有运行时修改它的 API；只有 `session.reload()` 会 `settingsManager.reload()` 重读文件（`dist/core/agent-session.js:2996-3007`），交互层随后按新值重建转录（`dist/modes/interactive/interactive-mode.js:5363`）。所以：
-
-- `/oneline setup`：写入 `hideThinkingBlock: true`（先记改前值），再调用 `ctx.reload()` 立即生效；
-- `session_start` 只做检测：值为 `false` 时提示一次"运行 `/oneline setup` 折叠思考"，**不静默改写**；
-- `/oneline reset`：还原改前值并 `ctx.reload()`。
+环境变量 `PI_ONELINE_MODE` 可临时覆盖模式（不写回文件，供集成测试与演示使用）。
 
 ## 8. 非目标
 
@@ -185,7 +193,6 @@
 | 渲染上下文的 `invalidate` = 组件失效 + `requestRender` | 同上 `:74-81` |
 | `setExpanded` → `updateDisplay()` 重跑渲染器 | 同上 `:139-142` |
 | 单次耗时由 `durationMs` 提供 | 同上 `:96` |
-| 思考块折叠为单行 `Text` | `dist/modes/interactive/components/assistant-message.js:110-118` |
 | 工具事件无 batch/message id，只能按回合切批 | `dist/core/extensions/types.d.ts:853` |
 
 ### A.2 真实会话验证（`npm run test:integration`）

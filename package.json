@@ -28,6 +28,6 @@
   ],
   "scripts": {
     "test": "node tests/batch.test.mjs",
-    "test:integration": "python3 spike/run-probe.py && python3 spike/run-probe.py --expand && python3 spike/run-probe.py --mode row --max-visible 3 && python3 spike/run-probe.py --mode off"
+    "test:integration": "python3 spike/run-probe.py && python3 spike/run-probe.py --expand && python3 spike/run-probe.py --prompt '用两个独立的工具调用：ls /tmp 和 cat /etc/hosts。' --prompt2 '再用两个工具调用：ls /etc 和 cat /etc/passwd。' && python3 spike/run-probe.py --mode row --max-visible 3 && python3 spike/run-probe.py --mode off"
   }
 }

@@ -43,11 +43,20 @@ const WORDS: Record<Labels, { calls: (n: number) => string; preparing: string; w
         },
 };
 
+let nextBatchId = 1;
+
 export class Batch {
+        /** 每轮一个批次；结束即冻结，后续渲染只读它的快照。 */
+        readonly id = nextBatchId++;
         calls: CallRec[] = [];
         turnEndedAt: number | undefined;
         interrupted = false;
         private invalidators = new Map<string, () => void>();
+
+        /** 冻结：此后不再接受新调用，耗时停止滚动。 */
+        freeze(interrupted = false): void {
+                this.interrupted = interrupted;
+        }
 
         reset(): void {
                 this.calls = [];
