@@ -1,3 +1,6 @@
 node_modules/
 dist/
 .DS_Store
+
+# Delta worktrees: 内含嵌套 git 仓库，既不该被 git add -A 收进去，也不该被 git clean 删掉
+.delta/
