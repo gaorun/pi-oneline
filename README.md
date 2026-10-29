@@ -6,7 +6,7 @@
 ▸ 3 calls · ls read grep · 1.7s
 ```
 
-状态：`v0.1.0` 已实现并打 tag。**尚未发布到 npm**（`npm view pi-oneline` 返回 404），目前从本地目录安装。
+状态：`v0.1.0` 已发布（tag + GitHub），可从 git 仓库安装，见「三、安装」。
 
 ## 一、要解决的问题
 
@@ -57,13 +57,28 @@ pi 的转录按「一块一则」渲染：每次工具调用占一片，参数�
 
 ## 三、安装
 
+两种来源，任选其一。
+
+**从 git 仓库（推荐，可锁版本）**
+
+```bash
+pi install git:github.com/gaorun/pi-oneline@v0.1.0
+pi list                                             # 确认已登记
+```
+
+git 源按 tag / commit 固定：`@v0.1.0` 之后 main 再往前走，本地也不会跟着变。升级要显式换成新 tag，或执行 `pi update --extensions` 让 pi 重新对齐。装了哪个 ref、落在哪个目录，`pi list` 会直接列出来。
+
+**从本地目录（开发期）**
+
 ```bash
 pi install ./pi-oneline        # 写入 ~/.pi/agent/settings.json
-pi list                        # 确认已登记
+pi list
 pi -e ./extensions/oneline     # 单次试跑，不改配置
 ```
 
-未发布到 npm；发布后为 `pi install npm:pi-oneline`。依赖 pi 侧提供的 `@earendil-works/pi-coding-agent` 与 `@earendil-works/pi-tui`，走 `peerDependencies`，不随包安装。
+卸载：`pi remove git:github.com/gaorun/pi-oneline@v0.1.0`（换成你实际装的来源）。
+
+依赖 `@earendil-works/pi-coding-agent` 与 `@earendil-works/pi-tui` 由 pi 侧提供，走 `peerDependencies`，不随包安装。
 
 ## 四、三种模式
 
