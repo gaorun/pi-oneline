@@ -201,7 +201,7 @@ export function detailLines(batch: Batch, opts: { cfg: Config; p: Palette }): st
                 return `${parts}${p.muted(dur)}${err}`;
         });
         if (batch.calls.length > shown.length) {
-                lines.push(`  ${p.dim("└")} ${p.muted(`… +${batch.calls.length - shown.length}`)}`);
+                lines.push(`  ${p.dim("└")} ${p.muted(`… +${batch.calls.length - shown.length} more`)}`);
         }
         return lines;
 }
