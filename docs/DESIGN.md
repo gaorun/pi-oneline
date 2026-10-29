@@ -73,6 +73,8 @@
 | 耗时 | 首个 `tool_execution_start` → 本回合最后一次 `turn_end` 的墙钟时间；<1s 显示 `0.7s`，≥60s 显示 `1m12s` |
 | 失败数 | `isError === true` 的调用数，为 0 时省略该段 |
 | 运行中计数 | `2/4` = 已完成/本回合已发起 |
+| 单复数 | 1 次调用写 `1 call`，其余写 `n calls`（zh：`1 次调用` / `n 次调用`） |
+| `preparing` | 模型已声明工具调用、但尚未开始执行（参数还在流式生成）时的状态词，实测存在且会停留数百毫秒，不能省略 |
 
 ### 3.3 宽度降级
 
@@ -85,6 +87,18 @@
 | 3 | 丢掉耗时 | `▸ 4 · ⚠1`（有失败）或 `▸ 4` |
 
 失败尾注 `⚠n` 任何宽度下都不丢弃：它决定这一回合要不要点开看。所有行经 `truncateToWidth()` 处理，中文与 emoji 按显示列宽计算。
+
+### 3.4 实测的状态序列（真实会话，`--tui-mode regular`）
+
+```text
+⠿ 1 call · ls · preparing
+⠿ 2 calls · ls read · preparing
+⠿ 3 calls · ls read grep · preparing
+▸ 3 calls · ls read grep · 0.1s
+▸ 3 calls · ls read grep · 1.7s
+```
+
+同一行内文本递增，不产生新行。最后一行从 `0.1s` 变为 `1.7s` 是 `turn_end` 把耗时终点从"最后一次工具结束"改判为"回合结束"（§3.2）。
 
 ## 4. 展开视图
 
@@ -174,12 +188,31 @@
 | 思考块折叠为单行 `Text` | `dist/modes/interactive/components/assistant-message.js:110-118` |
 | 工具事件无 batch/message id，只能按回合切批 | `dist/core/extensions/types.d.ts:853` |
 
+### A.2 真实会话验证（`npm run test:integration`）
+
+在 PTY 里跑真实 pi 会话（`pi -e extensions/oneline --tui-mode regular`），扩展把每次渲染决策写进 JSONL（`PI_ONELINE_DEBUG`），脚本据此断言。
+
+| 场景 | 命令 | 结果 |
+|---|---|---|
+| `group`，3 次调用 | `python3 spike/run-probe.py` | 末态 1 行，同帧多行 0 次，回弹 0 次 |
+| `group` + `ctrl+o` 展开 | `... --expand` | 明细 3 行，仍只有 1 个工具块有内容 |
+| `group` + `alt+t` | `... --keys '\x1bt'` | 明细 3 行，快捷键生效 |
+| `row` | `... --mode row --max-visible 3` | 3 行，无回弹 |
+| `off` | `... --mode off` | 渲染事件 0 个（完全走原生） |
+| `/oneline info` | `... --cmd "/oneline info" --expect "配置："` | 命令执行并回显配置 |
+
+补充结论：
+
+- **必须在 `message_start`/`message_update` 就预注册本批调用顺序**，不能等 `tool_execution_start`。实测 pi 会在参数流式阶段一次建好全部工具组件；晚注册会有 1 帧双行。
+- 失败标记可用：模型把 `docs/DESIGN.md` 传成 `DESIGN.md` 时返回 `Path not found`，汇总行显示 `⚠1`；而 `grep` 的"无匹配"在 `dist/core/tools/grep.js:194` 返回无 `isError` 的正常结果，不会误报。
+- 耗时终点取 `turn_end`：若取"最后一次工具结束"，3 个并行调用只跑 46ms，会显示 `0.0s`。
+
 ## 附录 B：已知风险
 
 | 风险 | 影响 | 对策 |
 |---|---|---|
-| 依赖 `ToolExecutionComponent` 的内部渲染时序 | pi 升级可能失效 | 启动时做一次自检（构造两个假行，断言"非末行为 0 行"），失败自动退回 `row` 模式 |
-| 隐藏行仍存在于转录模型 | HTML 导出可能缺详情 | 导出前切到 `row` 模式，或让导出复用展开态 |
+| 依赖 `ToolExecutionComponent` 的内部渲染时序 | pi 升级可能失效 | **无法**在扩展里构造假行自检：包的 `exports` 白名单挡住了 `dist/...` 深引用（实测 `ERR_PACKAGE_PATH_NOT_EXPORTED`）。改为运行时降级保护：渲染器抛错、或一次回合里渲染器从未被调用，就退回 `row` 模式并提示一次 |
+| 隐藏行仍存在于转录模型 | HTML 导出可能缺详情 | 导出前切到 `row` 模式（`PI_ONELINE_MODE=row pi export ...`） |
 | `ctrl+o` 会连带展开隐藏行 | 展开后可能出现空行区块 | 隐藏行在任何 `expanded` 取值下都渲染 0 行（与展开态解耦） |
 | 与其他工具渲染扩展冲突 | 互相覆盖 | 用 `registerToolRenderer(name, next)` 的 `next()` 先取既有实现 |
 | 流式中行数抖动 | 观感 | 旧行降级发生在下一行创建时，同帧完成，实测无中间态 |
